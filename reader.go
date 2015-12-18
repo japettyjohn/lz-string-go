@@ -1,82 +1,116 @@
+// Implements lzstring with the intention of receiving compressed output from a webpage.
+// Most easily made in javascript using a Uint16Array
 package lzstring
 
 import (
-	"bufio"
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"math"
-	"strings"
 )
 
-func NewReader(r io.Reader) (io.ReadCloser, error) {
-	d := &reader{
-		position:  32768,
-		data:      bufio.NewReader(r),
+const (
+	resetPosition = 32768
+)
+
+type Uint16Reader interface {
+	ReadUint16() (uint16, error)
+}
+
+type uint16Reader struct {
+	data  io.Reader
+	order binary.ByteOrder
+}
+
+func (r *uint16Reader) ReadUint16() (uint16, error) {
+	var word uint16
+	e := binary.Read(r.data, r.order, &word)
+	return word, e
+}
+
+// Expecting an array LittleEndian encoded uint16
+func NewReaderUint16LE(r io.Reader) (io.ReadCloser, error) {
+	return NewReader(&uint16Reader{r, binary.LittleEndian})
+}
+
+func NewReader(r Uint16Reader) (io.ReadCloser, error) {
+	d := &Reader{
+		position:  resetPosition,
 		dict:      map[int]string{0: "0", 1: "1", 2: "2"},
 		dictSize:  4,
 		result:    &bytes.Buffer{},
 		numBits:   3,
 		enlargeIn: 4,
+		data:      r,
 	}
+
 	if e := d.process(); e != nil {
 		return nil, e
 	}
+
+	// Get rid of original
+	d.data = nil
+
 	return d, nil
 }
 
-type reader struct {
-	currentVal                               int32
-	position                                 int32
-	data                                     *bufio.Reader
-	dict                                     map[int]string
-	lastEntry                                string
-	result                                   *bytes.Buffer
-	numBits, errorCount, dictSize, enlargeIn int
+type Reader struct {
+	currentVal                                         uint16
+	position                                           uint16
+	data                                               Uint16Reader
+	dict                                               map[int]string
+	lastEntry                                          string
+	result                                             *bytes.Buffer
+	numBits, errorCount, dictSize, enlargeIn, readSize int
 }
 
-func (r *reader) readBit() int32 {
+func (r *Reader) readBit() uint16 {
 	res := r.currentVal & r.position
 	r.position = r.position >> 1
 	if r.position == 0 {
-		r.position = 32768
+		r.position = resetPosition
 
-		if val, _, e := r.data.ReadRune(); e == io.EOF {
-			r.currentVal = 0
-		} else if e != nil {
-			// TODO: Deal with error
-		} else {
+		if val, e := r.data.ReadUint16(); e == io.EOF || e == nil {
 			r.currentVal = val
+		} else {
+			fmt.Println(e)
 		}
 	}
+
 	if res > 0 {
 		return 1
 	}
 	return 0
 }
 
-func (r *reader) readBits(numBits int) (res int32) {
+func (r *Reader) readBits(numBits int) (res uint16) {
 	maxpower := math.Pow(2, float64(numBits))
 	power := 1
 	for float64(power) != maxpower {
-		res = res | (int32(power) * r.readBit())
+		res = res | (uint16(power) * r.readBit())
 		power = power << 1
 	}
 	return
 }
 
-func (r *reader) Close() error {
+func (r *Reader) Close() error {
+	if r.result == nil {
+		return fmt.Errorf("Reader closed.")
+	}
+	r.result = nil
 	return nil
 }
 
-func (r *reader) process() error {
-	if v, _, e := r.data.ReadRune(); e != nil {
-		return e
+func (r *Reader) process() error {
+
+	if val, e := r.data.ReadUint16(); e == io.EOF || e == nil {
+		r.currentVal = val
 	} else {
-		r.currentVal = v
+		return e
 	}
 
-	var c int32
+	var c uint16
 	switch r.readBits(2) {
 	case 0:
 		c = r.readBits(8)
@@ -87,14 +121,14 @@ func (r *reader) process() error {
 	}
 
 	r.dict[3] = fmt.Sprintf("%c", c)
-	r.result.WriteRune(c)
+	r.result.WriteRune(rune(c))
 	r.lastEntry = r.dict[3]
 
 	for {
 
 		bitsRead := r.readBits(r.numBits)
-		var 			dictIndex = r.dictSize
-		
+		var dictIndex = r.dictSize
+
 		switch bitsRead {
 		case 0:
 			if r.errorCount++; r.errorCount > 10000 {
@@ -145,10 +179,13 @@ func (r *reader) process() error {
 	return nil
 }
 
-func (r *reader) Read(b []byte) (int, error) {
+func (r *Reader) Read(b []byte) (int, error) {
+	if r.result == nil {
+		return 0, fmt.Errorf("Reader closed.")
+	}
 	return r.result.Read(b)
 }
 
-func (r *reader) String() string {
+func (r *Reader) String() string {
 	return r.result.String()
 }
